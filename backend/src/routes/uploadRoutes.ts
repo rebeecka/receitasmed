@@ -5,8 +5,7 @@ import pdfParse from "pdf-parse";
 import axios from "axios";
 import DocumentModel from "../models/Document";
 import PrescriptionModel from "../models/Prescription";
-import Patient from "models/Patient";
-
+import Patient from "../models/Patient";
 const router = Router();
 const upload = multer({ dest: "uploads/" });
 
