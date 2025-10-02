@@ -1,5 +1,5 @@
 {
-  "name": "receituario-backend",
+  "name": "backend",
   "version": "1.0.0",
   "description": "Backend para upload e processamento de PDFs de exames e geração de prescrições com IA",
   "main": "dist/server.js",
