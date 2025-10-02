@@ -181,7 +181,7 @@ router.post("/gerar-receituario", upload.single("exame"), async (req: Request, r
     }
 
     // c) Carregar template e escrever as 5 seções
-    const tplPath = path.join(process.cwd(), "assets", "Receituario_Fernando_Fernandes.pdf");
+    const tplPath = path.join(process.cwd(), "assets", "receituario.pdf");
     const tplBytes = await fs.readFile(tplPath);
     const pdfDoc = await PDFDocument.load(tplBytes);
     const page = pdfDoc.getPages()[0];
