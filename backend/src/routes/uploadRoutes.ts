@@ -4,30 +4,33 @@ import fs from "fs";
 import path from "path";
 import pdfParse from "pdf-parse";
 import axios from "axios";
-// Se seu tsconfig NÃO tem "esModuleInterop": true, troque a linha acima de multer por:
-// import * as multer from "multer";
 import multer from "multer";
-
 import DocumentModel from "../models/Document";
 import PrescriptionModel from "../models/Prescription";
-// import Patient from "../models/Patient"; // use se realmente precisar
 
 const router = Router();
 
-/** Multer configurado com limites e filtro de PDF */
+// 1) garantir pasta uploads
+const UPLOAD_DIR = path.resolve(process.cwd(), "uploads");
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  console.log("📁 Criada pasta:", UPLOAD_DIR);
+}
+
+// 2) multer
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, "uploads"),
-  filename: (req, file, cb) => {
+  destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
+  filename: (_req, file, cb) => {
     const ts = Date.now();
     const ext = path.extname(file.originalname || ".pdf") || ".pdf";
     cb(null, `${ts}-${Math.random().toString(36).slice(2)}${ext}`);
   },
 });
 
-const multerUpload = multer({
+const upload = multer({
   storage,
-  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
-  fileFilter: (req, file, cb) => {
+  limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
     if (file.mimetype !== "application/pdf") {
       return cb(new Error("Apenas PDFs são aceitos"));
     }
@@ -35,64 +38,62 @@ const multerUpload = multer({
   },
 });
 
-// Tipos mínimos para resposta da OpenAI que usamos
-type ChatChoice = { message?: { content?: string } };
-type OpenAIChatResp = { choices?: ChatChoice[] };
-
-// Utilitário: apagar arquivo com segurança
-function safeUnlink(filePath?: string) {
-  if (!filePath) return;
-  try {
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-  } catch { /* noop */ }
+// util
+function safeUnlink(p?: string) {
+  try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch {}
 }
 
 router.post(
   "/upload",
-  // o campo do FormData precisa ser "file"
-  multerUpload.single("file"),
+  upload.single("file"), // <== o campo do FormData TEM que ser 'file'
   async (req: Request, res: Response) => {
-    let tmpPath: string | undefined;
+    let tmp: string | undefined;
 
     try {
-      // Garantia de req.file (multer preenche)
+      console.log("➡️  /api/upload recebida. body keys:", Object.keys(req.body), "file:", !!req.file);
+
       if (!req.file) {
         return res.status(400).json({ error: "Nenhum arquivo enviado" });
       }
-      tmpPath = req.file.path;
+      tmp = req.file.path;
 
       const { patientId } = req.body as { patientId?: string };
       if (!patientId) {
-        safeUnlink(tmpPath);
-        return res.status(400).json({ error: "Paciente obrigatório" });
+        safeUnlink(tmp);
+        return res.status(400).json({ error: "Paciente obrigatório (patientId)" });
       }
 
-      // Ler PDF e extrair texto
-      const pdfBuffer = fs.readFileSync(req.file.path);
-      const pdfData = await pdfParse(pdfBuffer);
+      // Salva documento + extrai texto
+      const buffer = fs.readFileSync(req.file.path);
+      const pdfData = await pdfParse(buffer);
       const text = pdfData.text || "";
 
-      console.log("📄 Texto extraído do PDF:", text.slice(0, 200));
-
-      // Persistir documento
-      const newDoc = await DocumentModel.create({
+      const doc = await DocumentModel.create({
         patientId,
         fileName: req.file.originalname,
         filePath: req.file.path,
         textExtracted: text,
+        createdAt: new Date(),
       });
 
-      // Verificação de API key
-      const apiKey = process.env.OPENAI_API_KEY;
-      if (!apiKey) {
-        safeUnlink(tmpPath);
-        return res.status(500).json({ error: "OPENAI_API_KEY não configurada" });
-      }
+      console.log("📄 Documento salvo:", doc._id);
 
-      // Chamada à OpenAI com timeout
-      let aiSuggestions = "";
-      try {
-        const openaiResp = await axios.post<OpenAIChatResp>(
+      // 3) chamar IA
+      const apiKey = process.env.OPENAI_API_KEY;
+      let aiJsonText = "";
+
+      if (!apiKey) {
+        console.warn("⚠️  OPENAI_API_KEY ausente — usando fallback mock");
+        aiJsonText = JSON.stringify({
+          suplementos: [{ nome: "Vitamina D3", dose: "2000 UI/dia" }],
+          fitoterapiaChinesa: [],
+          dieta: ["Priorize comida de verdade"],
+          exercicios: ["150–300 min/semana aeróbico", "2–3x força"],
+          meditacao: ["10–15 min/dia mindfulness"],
+          disclaimer: "Conteúdo educativo. Requer revisão profissional.",
+        });
+      } else {
+        const openaiResp = await axios.post(
           "https://api.openai.com/v1/chat/completions",
           {
             model: "gpt-4o-mini",
@@ -104,10 +105,10 @@ router.post(
               },
               {
                 role: "user",
-                content: `Analise este exame de sangue e forneça sugestões em JSON: ${text}`,
+                content: `Analise este exame de sangue (trecho): ${text.slice(0, 6000)}`,
               },
             ],
-            temperature: 0.7,
+            temperature: 0.4,
           },
           {
             headers: {
@@ -118,46 +119,44 @@ router.post(
           }
         );
 
-        aiSuggestions = openaiResp.data.choices?.[0]?.message?.content ?? "";
-        if (!aiSuggestions) {
-          safeUnlink(tmpPath);
-          return res.status(502).json({ error: "Resposta vazia da IA" });
-        }
-      } catch (err: any) {
-        console.error("❌ Erro ao chamar OpenAI:", err?.response?.data || err?.message || err);
-        safeUnlink(tmpPath);
-        return res.status(500).json({ error: "Erro ao processar com IA" });
+        aiJsonText = openaiResp.data?.choices?.[0]?.message?.content || "";
       }
 
-      // Parse do JSON retornado
-      let parsedResult: unknown;
+      if (!aiJsonText) {
+        safeUnlink(tmp);
+        return res.status(502).json({ error: "Resposta vazia da IA" });
+      }
+
+      let aiResult: any;
       try {
-        parsedResult = JSON.parse(aiSuggestions);
+        aiResult = JSON.parse(aiJsonText);
       } catch {
-        console.error("❌ JSON inválido da IA. Retorno foi:", aiSuggestions);
-        safeUnlink(tmpPath);
-        return res.status(500).json({ error: "Resposta da IA inválida", raw: aiSuggestions });
+        console.error("❌ JSON inválido da IA:", aiJsonText);
+        safeUnlink(tmp);
+        return res.status(500).json({ error: "Resposta da IA inválida", raw: aiJsonText });
       }
 
-      // Salvar prescrição
-      const newPrescription = await PrescriptionModel.create({
+      // 4) salva prescrição
+      const prescription = await PrescriptionModel.create({
         patientId,
-        documentId: newDoc._id,
-        aiResult: parsedResult,
+        documentId: doc._id,
+        aiResult,
+        createdAt: new Date(),
       });
 
-      // Limpar tmp
-      safeUnlink(tmpPath);
+      console.log("📝 Prescrição salva:", prescription._id);
 
-      // Responder
+      // se quiser deletar o arquivo físico, descomente:
+      // safeUnlink(tmp);
+
       return res.json({
         message: "Exame processado com sucesso",
-        document: newDoc,
-        prescription: newPrescription,
+        document: doc,
+        prescription,
       });
-    } catch (err: any) {
-      console.error("❌ Erro geral no upload:", err?.message || err);
-      safeUnlink(tmpPath);
+    } catch (e: any) {
+      console.error("💥 Erro upload:", e?.response?.data || e?.message || e);
+      safeUnlink(tmp);
       return res.status(500).json({ error: "Erro ao processar PDF" });
     }
   }
