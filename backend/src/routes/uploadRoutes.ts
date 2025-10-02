@@ -147,7 +147,7 @@ router.post("/analisar-exame", upload.single("exame"), async (req: Request, res:
       tablesRaw: tables // <- se quiser renderizar tabelas no front
     });
   } catch (e: any) {
-    console.error("Erro /analisar-exame-universal:", e);
+    console.error("Erro /analisar-exame:", e);
     return res.status(500).json({ error: e?.message || String(e) });
   }
 });
@@ -224,7 +224,7 @@ router.post("/gerar-receituario", upload.single("exame"), async (req: Request, r
     res.setHeader("Content-Disposition", `attachment; filename="Receituario_${Date.now()}.pdf"`);
     return res.status(200).send(Buffer.from(out));
   } catch (e: any) {
-    console.error("Erro /gerar-receituario-universal:", e);
+    console.error("Erro /gerar-receituario:", e);
     return res.status(500).json({ error: e?.message || String(e) });
   }
 });

@@ -4,7 +4,7 @@
   "description": "Backend para upload e processamento de PDFs de exames e geração de prescrições com IA",
   "main": "dist/server.js",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && cp -R assets dist/assets",
     "start": "node dist/server.js",
     "dev": "ts-node-dev src/server.ts"
   },
