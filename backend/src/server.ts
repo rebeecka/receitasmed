@@ -19,8 +19,8 @@ mongoose
   .catch((err) => console.error("❌ Erro ao conectar no MongoDB:", err));
 
 // --- Rotas ---
-app.use("/api", uploadRoutes);
+app.use("/", uploadRoutes);
 
 // --- Porta ---
-const PORT = process.env.PORT || 4000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Backend rodando na porta ${PORT}`));
