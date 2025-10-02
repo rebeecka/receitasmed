@@ -11,7 +11,7 @@ app.use(cors());
 app.use(express.json());
 
 // --- Conexão com MongoDB ---
-const mongoURI = process.env.MONGO_URI || "mongodb://localhost:27017/receituario";
+const mongoURI = process.env.MONGO_URI || "mongodb+srv://rebecca:R39716938a@cluster0.mb29cqx.mongodb.net/receitasmed_db?retryWrites=true&w=majority:4000/receituario";
 
 mongoose
   .connect(mongoURI)
