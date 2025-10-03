@@ -59,6 +59,10 @@ app.get("/health-ia", async (_req, res) => {
 //  - /gerar-receituario  e  /gerar-receituario-universal
 app.use("/", router);
 app.use(suggestRouter);
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true }));
+
+
 // --- 404 sempre em JSON (evita HTML no Render/Express) ---
 app.use((req, res) => {
   res.status(404).json({
