@@ -17,7 +17,9 @@
     "openai": "^4.63.0",
     "pdf-parse": "^1.1.1",
     "pdf-lib": "1.17.1",
-    "pdfkit": "0.13.0"
+    "pdfkit": "0.13.0",
+    "axios": "^1.7.7"
+
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
