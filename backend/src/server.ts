@@ -56,8 +56,8 @@ app.get("/health-ia", async (_req, res) => {
 });
 
 // --- ROTAS PRINCIPAIS (Monte com prefixo /api) ---
-app.use("/api", router);         // <- agora /api/analisar-exame, /api/gerar-receituario, etc.
-app.use("/api", suggestRouter);  // <- agora /api/suggest
+app.use("/", router);         // <- agora /api/analisar-exame, /api/gerar-receituario, etc.
+app.use("/", suggestRouter);  // <- agora /api/suggest
 
 // --- 404 JSON ---
 app.use((req, res) => {
