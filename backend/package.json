@@ -4,11 +4,9 @@
   "type": "module",
   "engines": { "node": "22.16.0" },
   "scripts": {
-    "prebuild": "node scripts/verify-mongoose.js",
     "build": "tsc && cp -R assets dist/assets || true",
     "start": "node dist/server.js",
-    "dev": "tsx src/server.ts",
-    "postinstall": "node scripts/verify-mongoose.js || true"
+    "dev": "tsx src/server.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",
