@@ -218,7 +218,9 @@ async function aiPlanFromTests(
 // ---------- Router ----------
 const router = Router();
 
-// Handler de análise (compartilhado)
+/* ==========================
+   1) ANÁLISE (retorna rawText!)
+   ========================== */
 const analisarHandler = async (req: Request, res: Response) => {
   try {
     if (!req.file) return res.status(400).json({ error: "Arquivo não enviado (campo 'exame')." });
@@ -257,6 +259,7 @@ const analisarHandler = async (req: Request, res: Response) => {
       textSnippet: text.slice(0, 1500),
       tests,
       tablesRaw: tables,
+      rawText: text, // <<--- IMPORTANTE para o app navegar com o texto
     });
   } catch (e: any) {
     console.error("Erro /analisar-exame:", e);
@@ -264,7 +267,9 @@ const analisarHandler = async (req: Request, res: Response) => {
   }
 };
 
-// Handler de geração (compartilhado)
+/* ==========================
+   2) GERAÇÃO DE PDF
+   ========================== */
 const gerarHandler = async (req: Request, res: Response) => {
   try {
     // a) Pega tests do cliente (se vierem)
@@ -391,6 +396,60 @@ const gerarHandler = async (req: Request, res: Response) => {
     return res.status(500).json({ error: e?.message || String(e) });
   }
 };
+
+/* ==========================
+   3) SUGESTÕES EM JSON (para o app)
+   ========================== */
+router.post("/suggest", async (req: Request, res: Response) => {
+  try {
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(400).json({ error: "OPENAI_API_KEY ausente" });
+    }
+
+    // Aceita tests (array) *ou* rawExamText (string)
+    let tests: Array<{ label: string; value?: number; unit?: string }> | null = null;
+    let rawText = "";
+
+    if (Array.isArray(req.body?.tests)) {
+      tests = req.body.tests;
+    } else if (typeof req.body?.tests === "string") {
+      try { tests = JSON.parse(req.body.tests); } catch {
+        return res.status(400).json({ error: "Formato inválido de 'tests' (JSON string)." });
+      }
+    }
+
+    if (!tests && typeof req.body?.rawExamText === "string") {
+      rawText = String(req.body.rawExamText || "").replace(/\r/g, "");
+      const lines = rawText.split("\n").map((s: string) => s.trim()).filter(Boolean);
+      const kv = parseKeyValues(lines).map((k) => ({ label: k.label, value: k.value, unit: k.unit }));
+      const tables = parseTables(lines);
+      const tableTests = tablesToTests(tables);
+      tests = [...tableTests, ...kv];
+    }
+
+    if (!tests || tests.length === 0) {
+      return res.status(400).json({ error: "Envie 'rawExamText' (string) ou 'tests' (array)." });
+    }
+
+    const ai = await aiPlanFromTests(
+      tests.map((t) => ({ label: t.label, value: t.value, unit: t.unit })),
+      { rawText }
+    );
+
+    const suggestions = {
+      supplements: ai.suplementos ?? [],
+      fitoterapia: ai.fitoterapia_chinesa ?? [],
+      dieta: ai.dieta ?? [],
+      exercicios: ai.exercicios ?? [],
+      estiloVida: [...(ai.meditacao ?? []), ...(ai.observacoes ?? [])],
+    };
+
+    return res.json({ suggestions });
+  } catch (e: any) {
+    console.error("Erro /suggest:", e);
+    return res.status(500).json({ error: e?.message || String(e) });
+  }
+});
 
 // ---------- Rotas (com aliases p/ compatibilidade) ----------
 // análise
