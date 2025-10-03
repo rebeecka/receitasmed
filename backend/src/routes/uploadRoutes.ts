@@ -1,6 +1,5 @@
 /// <reference types="node" />
 
-// backend/src/routes/uploadRoutes.ts
 import express, { Request, Response } from "express";
 import multer from "multer";
 import _pdfParse from "pdf-parse";
@@ -11,15 +10,15 @@ import PDFDocument from "pdfkit";
 
 const router = express.Router();
 
-/* ------------------------- OpenAI ------------------------- */
+/** OpenAI */
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-/* --------- pdf-parse compat (funciona em TS/ESM e CJS) --------- */
+/** pdf-parse compat CJS/ESM */
 const pdfParse: (data: Buffer) => Promise<{ text: string; numpages: number; info: any }> =
- 
+
   (_pdfParse as any)?.default ?? (_pdfParse as any);
 
-/* ------------------------- Tipos ------------------------- */
+/** Tipos */
 type PlanKeys = "supplements" | "fitoterapia" | "dieta" | "exercicios" | "estiloVida";
 export interface Plan {
   supplements: string[];
@@ -43,13 +42,9 @@ type SuggestErr = {
   message?: string;
 };
 type SuggestResult = SuggestOk | SuggestErr;
+function isSuggestErr(r: SuggestResult): r is SuggestErr { return r.ok === false; }
 
-/* ------------------------- Type guards ------------------------- */
-function isSuggestErr(r: SuggestResult): r is SuggestErr {
-  return r.ok === false;
-}
-
-/* ------------------------- Mongoose ------------------------- */
+/** Mongoose */
 const ExamSchema = new Schema(
   {
     filename: String,
@@ -57,38 +52,32 @@ const ExamSchema = new Schema(
     size: Number,
     hash: { type: String, index: true },
     text: String,
-    meta: Object,
+    meta: Object
   },
   { timestamps: true }
 );
 type ExamDoc = InferSchemaType<typeof ExamSchema> & { _id: mongoose.Types.ObjectId };
-const Exam =
-  (mongoose.models.Exam as mongoose.Model<ExamDoc>) ||
-  mongoose.model<ExamDoc>("Exam", ExamSchema);
+const Exam = (mongoose.models.Exam as mongoose.Model<ExamDoc>) || mongoose.model<ExamDoc>("Exam", ExamSchema);
 
-/* ------------------------- Multer (memória) ------------------------- */
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
-});
+/** Multer memória */
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 
-/* ------------------------- Cache (só sucesso IA) ------------------------- */
+/** Cache */
 const memCache = new Map<string, CachePayload>();
 
-/* ------------------------- Utils ------------------------- */
-function examKey(text: string): string {
-  return createHash("sha256").update(text).digest("hex");
-}
-function bufToSha256(buf: Buffer): string {
-  return createHash("sha256").update(buf).digest("hex");
-}
+/** Utils */
+const examKey = (text: string) => createHash("sha256").update(text).digest("hex");
+const bufToSha256 = (buf: Buffer) => createHash("sha256").update(buf).digest("hex");
+
+/** Prompt IA – SEM regras determinísticas, 100% personalizado por exame */
 function montarPrompt(extractedText: string): string {
   return [
-    "Você é um assistente clínico que cria um PLANO ESTRUTURADO e ESTRITAMENTE PERSONALIZADO a partir do texto de um exame laboratorial.",
-    "Use SOMENTE o que estiver no exame; não invente marcadores ausentes.",
-    'Formato de saída: JSON VÁLIDO exatamente com as chaves {"supplements":[],"fitoterapia":[],"dieta":[],"exercicios":[],"estiloVida":[]}.',
-    "Cada item deve ser uma frase curta, prática e específica ao achado.",
-    "Se uma seção não tiver recomendações, retorne array vazio.",
+    "Gere recomendações PERSONALIZADAS estritamente a partir do exame abaixo.",
+    'Responda SOMENTE com JSON VÁLIDO no formato: {"supplements":[],"fitoterapia":[],"dieta":[],"exercicios":[],"estiloVida":[]}.',
+    "Regras:",
+    "- Use apenas o que está no texto (sem inventar marcadores).",
+    "- Frases curtas e práticas, específicas ao achado.",
+    "- Se alguma categoria não tiver nada, devolva [].",
     "",
     "Exame (texto bruto):",
     extractedText.slice(0, 18000),
@@ -105,7 +94,7 @@ function parsePlano(modelOutput: string): Plan {
       estiloVida: Array.isArray(maybe?.estiloVida) ? (maybe.estiloVida as string[]) : [],
     };
   } catch {
-    // fallback: tenta raspar blocos rotulados
+    // fallback leve: tenta raspar blocos
     const out: Plan = { supplements: [], fitoterapia: [], dieta: [], exercicios: [], estiloVida: [] };
     const sections: Array<{ key: PlanKeys; rx: RegExp; bodyIndex?: number }> = [
       { key: "supplements", rx: /(suplementos?|supplements?)\s*[:\-]\s*([\s\S]+?)(?:\n\n|$)/i, bodyIndex: 2 },
@@ -128,14 +117,11 @@ function parsePlano(modelOutput: string): Plan {
     return out;
   }
 }
-
 async function safeSuggest(prompt: string, model = process.env.SUGGEST_MODEL || "gpt-4o-mini"): Promise<SuggestResult> {
   try {
     const r = await openai.chat.completions.create({
       model,
       temperature: 0.2,
-      // Se sua conta permitir, force JSON:
-      // response_format: { type: "json_object" } as any,
       messages: [
         { role: "system", content: "Responda SOMENTE com JSON válido." },
         { role: "user", content: prompt },
@@ -153,7 +139,6 @@ async function safeSuggest(prompt: string, model = process.env.SUGGEST_MODEL || 
       headers?: Headers | { get?(k: string): string | undefined };
       message?: string;
     };
-
     const status = e?.status;
     const code = e?.error?.code || e?.code;
     const type = e?.error?.type || e?.type;
@@ -172,27 +157,19 @@ async function safeSuggest(prompt: string, model = process.env.SUGGEST_MODEL || 
   }
 }
 
-/* ------------------------- Handler comum (upload buffer) ------------------------- */
+/** Upload handler */
 async function handleUploadBuffer(
   file: { originalname: string; mimetype: string; size: number; buffer: Buffer },
   res: Response
 ) {
-  if (file.mimetype !== "application/pdf") {
-    console.warn("[upload] MIME recebido:", file.mimetype);
-  }
-
   const parsed = await pdfParse(file.buffer);
-  console.log("[upload] pdf-parse ok. pages:", parsed?.numpages);
-
   const extractedText: string = (parsed?.text || "").trim();
   if (!extractedText) {
     return res.status(422).json({
-      error: "PDF sem texto extraível (provavelmente escaneado).",
-      hint: "Peça ao laboratório um PDF exportado com texto ou habilite OCR.",
-      pages: parsed?.numpages ?? undefined,
+      error: "PDF sem texto extraível.",
+      hint: "Peça ao laboratório um PDF exportado com texto ou use OCR."
     });
   }
-
   const fileHash = bufToSha256(file.buffer);
   const doc = await Exam.findOneAndUpdate(
     { hash: fileHash },
@@ -206,7 +183,6 @@ async function handleUploadBuffer(
     },
     { new: true, upsert: true, setDefaultsOnInsert: true }
   );
-
   return res.json({
     ok: true,
     examId: doc._id,
@@ -218,9 +194,7 @@ async function handleUploadBuffer(
   });
 }
 
-/* ------------------------- Rotas de upload (com aliases) ------------------------- */
-
-// Oficial: /upload
+/** Rotas de upload */
 router.post("/upload", upload.single("exame"), async (req: Request, res: Response) => {
   try {
     if (!req.file) return res.status(400).json({ error: "Selecione um PDF no campo 'exame'." });
@@ -241,8 +215,7 @@ router.post("/upload", upload.single("exame"), async (req: Request, res: Respons
     return res.status(500).json({ error: "Falha no upload/análise do PDF." });
   }
 });
-
-// Aliases: /analisar-exame e /analisarexame
+// Alias: /analisar-exame
 router.post("/analisar-exame", upload.single("exame"), async (req: Request, res: Response) => {
   try {
     if (!req.file) return res.status(400).json({ error: "Selecione um PDF no campo 'exame'." });
@@ -263,6 +236,8 @@ router.post("/analisar-exame", upload.single("exame"), async (req: Request, res:
     return res.status(500).json({ error: "Falha no upload/análise do PDF." });
   }
 });
+
+// Alias: /analisarexame
 router.post("/analisarexame", upload.single("exame"), async (req: Request, res: Response) => {
   try {
     if (!req.file) return res.status(400).json({ error: "Selecione um PDF no campo 'exame'." });
@@ -284,7 +259,7 @@ router.post("/analisarexame", upload.single("exame"), async (req: Request, res: 
   }
 });
 
-// Opcional JSON/base64
+/** Upload via JSON (base64) */
 router.post("/analisar-exame-json", async (req: Request, res: Response) => {
   try {
     const { pdfBase64, filename = "exame.pdf", mimetype = "application/pdf" } = req.body || {};
@@ -292,12 +267,7 @@ router.post("/analisar-exame-json", async (req: Request, res: Response) => {
     const buffer = Buffer.from(pdfBase64, "base64");
     if (!buffer.length) return res.status(400).json({ error: "pdfBase64 inválido." });
     return await handleUploadBuffer(
-      {
-        originalname: filename,
-        mimetype,
-        size: buffer.length,
-        buffer,
-      },
+      { originalname: filename, mimetype, size: buffer.length, buffer },
       res
     );
   } catch (err) {
@@ -306,7 +276,7 @@ router.post("/analisar-exame-json", async (req: Request, res: Response) => {
   }
 });
 
-/* ------------------------- GET exame ------------------------- */
+/** GET exame */
 router.get("/exam/:id", async (req: Request, res: Response) => {
   try {
     const doc = await Exam.findById(req.params.id).lean();
@@ -318,38 +288,28 @@ router.get("/exam/:id", async (req: Request, res: Response) => {
   }
 });
 
-/* ------------------------- IA: suggest ------------------------- */
+/** IA: sugestão por categorias (sem regras fixas, 100% exame) */
 router.post("/suggest", async (req: Request, res: Response) => {
   try {
     let extractedText = req.body?.extractedText as string | undefined;
-
     if (!extractedText && req.body?.examId) {
       const doc = await Exam.findById(req.body.examId as string).lean();
       if (!doc) return res.status(404).json({ error: "Exame não encontrado." });
       extractedText = (doc as any).text as string;
     }
-    if (!extractedText) {
-      return res.status(400).json({ error: "Forneça 'extractedText' ou 'examId'." });
-    }
+    if (!extractedText) return res.status(400).json({ error: "Forneça 'extractedText' ou 'examId'." });
 
     const key = examKey(extractedText);
     const cached = memCache.get(key);
-    if (cached) {
-      return res.json({ fromCache: true, ...cached });
-    }
+    if (cached) return res.json({ fromCache: true, ...cached });
 
     const prompt = montarPrompt(extractedText);
 
-    // 1) primeira tentativa
     let result = await safeSuggest(prompt, process.env.SUGGEST_MODEL || "gpt-4o-mini");
-
-    // 2) fallback se quota e houver modelo de fallback
     if (isSuggestErr(result) && result.kind === "quota" && process.env.SUGGEST_MODEL_FALLBACK) {
-      const second = await safeSuggest(prompt, process.env.SUGGEST_MODEL_FALLBACK);
-      result = second;
+      result = await safeSuggest(prompt, process.env.SUGGEST_MODEL_FALLBACK);
     }
 
-    // 3) sucesso
     if (!isSuggestErr(result)) {
       const plan = parsePlano(result.data);
       const payload: CachePayload = { plan, modelUsed: result.modelUsed, at: Date.now() };
@@ -357,12 +317,9 @@ router.post("/suggest", async (req: Request, res: Response) => {
       return res.json(payload);
     }
 
-    // 4) erro
-    const motivo = result.kind === "quota" ? "quota_exceeded" : result.kind === "rate" ? "rate_limited" : "ai_error";
-
     return res.status(503).json({
       error: "AI temporarily unavailable",
-      reason: motivo,
+      reason: result.kind,
       requestId: result.requestId,
       retryAfter: result.retryAfter,
       message: result.message,
@@ -373,8 +330,7 @@ router.post("/suggest", async (req: Request, res: Response) => {
   }
 });
 
-/* ------------------------- Gerar PDF do receituário (pdfkit) ------------------------- */
-// POST /receituario/pdf  body: { paciente?, crm?, data?, observacoes?, plano: Plan }
+/** PDF: receituário simples (pdfkit) – mantém para compatibilidade */
 router.post("/receituario/pdf", async (req: Request<{}, {}, { paciente?: string; crm?: string; data?: string; observacoes?: string; plano: Plan }>, res: Response) => {
   try {
     const { paciente, crm, data, observacoes, plano } = req.body || {};
@@ -395,14 +351,12 @@ router.post("/receituario/pdf", async (req: Request<{}, {}, { paciente?: string;
     const doc = new PDFDocument({ margin: 50 });
     doc.pipe(res);
 
-    // Cabeçalho
     doc.fontSize(18).text("Receituário", { align: "center" }).moveDown(0.5);
     doc.fontSize(10).text(`Paciente: ${paciente || "-"}`);
     doc.text(`CRM: ${crm || "-"}`);
     doc.text(`Data: ${data || new Date().toLocaleDateString("pt-BR")}`);
     doc.moveDown();
 
-    // Seções
     const sections: Array<{ key: PlanKeys; title: string }> = [
       { key: "supplements", title: "Suplementos" },
       { key: "fitoterapia", title: "Fitoterapia" },
@@ -420,9 +374,7 @@ router.post("/receituario/pdf", async (req: Request<{}, {}, { paciente?: string;
       if (!arr?.length) {
         doc.text("—", { indent: 12 }).moveDown(0.5);
       } else {
-        for (const item of arr) {
-          doc.text(`• ${item}`, { indent: 12 });
-        }
+        for (const item of arr) doc.text(`• ${item}`, { indent: 12 });
         doc.moveDown(0.8);
       }
     }
@@ -439,9 +391,7 @@ router.post("/receituario/pdf", async (req: Request<{}, {}, { paciente?: string;
   }
 });
 
-/* --------- Gerar PDF via TEMPLATE (AcroForm) com pdf-lib 1.17.1 --------- */
-// POST /receituario/pdf-template
-// body: { pdfTemplateBase64, paciente?, crm?, data?, observacoes?, plano: Plan }
+/** PDF no SEU TEMPLATE (AcroForm) – como estava antes */
 router.post("/receituario/pdf-template", async (req: Request, res: Response) => {
   try {
     const { pdfTemplateBase64, paciente, crm, data, observacoes, plano } = req.body || {};
@@ -456,21 +406,14 @@ router.post("/receituario/pdf-template", async (req: Request, res: Response) => 
       estiloVida: Array.isArray(plano?.estiloVida) ? plano.estiloVida : [],
     };
 
+    const { PDFDocument } = await import("pdf-lib");
     const templateBytes = Buffer.from(pdfTemplateBase64, "base64");
-    const { PDFDocument, StandardFonts, rgb } = await import("pdf-lib");
-
     const pdfDoc = await PDFDocument.load(templateBytes);
     const form = pdfDoc.getForm();
 
     const joinList = (arr: string[]) => (arr || []).map((s) => `• ${s}`).join("\n");
-
     const setIfExists = (name: string, value: string) => {
-      try {
-        const field = form.getTextField(name);
-        field.setText(value ?? "");
-      } catch {
-        // campo não existe
-      }
+      try { form.getTextField(name).setText(value ?? ""); } catch {}
     };
 
     setIfExists("paciente", paciente ?? "");
@@ -483,67 +426,8 @@ router.post("/receituario/pdf-template", async (req: Request, res: Response) => 
     setIfExists("exercicios", joinList(normalized.exercicios));
     setIfExists("estiloVida", joinList(normalized.estiloVida));
 
-    const anyField = ["paciente","crm","data","observacoes","supplements","fitoterapia","dieta","exercicios","estiloVida"]
-      .some(name => { try { form.getTextField(name); return true; } catch { return false; } });
-
-    if (!anyField) {
-      const page = pdfDoc.addPage();
-      const { width, height } = page.getSize();
-      const margin = 50;
-      const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-      const bold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-
-      let y = height - margin;
-      const lineH = 14;
-
-      const write = (text: string, isBold = false) => {
-        const chunks = text.split("\n");
-        for (const c of chunks) {
-          page.drawText(c, {
-            x: margin,
-            y,
-            size: 12,
-            font: isBold ? bold : font,
-            color: rgb(0, 0, 0),
-          });
-          y -= lineH;
-          if (y < margin) {
-            const p = pdfDoc.addPage();
-            y = p.getSize().height - margin;
-          }
-        }
-      };
-
-      write("Receituário (fallback - sem campos no template)", true);
-      write("");
-      write(`Paciente: ${paciente ?? "-"}`);
-      write(`CRM: ${crm ?? "-"}`);
-      write(`Data: ${data ?? new Date().toLocaleDateString("pt-BR")}`);
-      write("");
-
-      const sections: Array<{ title: string; arr: string[] }> = [
-        { title: "Suplementos", arr: normalized.supplements },
-        { title: "Fitoterapia", arr: normalized.fitoterapia },
-        { title: "Dieta", arr: normalized.dieta },
-        { title: "Exercícios", arr: normalized.exercicios },
-        { title: "Estilo de vida", arr: normalized.estiloVida },
-      ];
-
-      for (const s of sections) {
-        write(s.title, true);
-        if (!s.arr.length) write("—");
-        else write(s.arr.map((i) => `• ${i}`).join("\n"));
-        write("");
-      }
-
-      if (observacoes) {
-        write("Observações", true);
-        write(observacoes);
-      }
-    }
-
-    // Se quiser manter campos editáveis, comente a linha abaixo
-    form.flatten();
+    // mantenho editável como antes: NÃO flatten
+    // form.flatten(); // <- se quiser tornar não editável, descomente
 
     const out = await pdfDoc.save();
     res.setHeader("Content-Type", "application/pdf");
