@@ -1,463 +1,289 @@
-import { Router, Request, Response } from "express";
+// backend/src/routes/uploadRoutes.ts
+import express, { Request, Response } from "express";
 import multer from "multer";
+// @ts-ignore - pdf-parse não exporta tipos completos por padrão
 import pdfParse from "pdf-parse";
-import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
-import fs from "node:fs/promises";
-import path from "node:path";
-import OpenAI from "openai";
+import { createHash } from "node:crypto";
+import mongoose, { Schema, InferSchemaType } from "mongoose";
+import OpenAI, { APIError } from "openai";
 
-// ---------- Config IA ----------
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const router = express.Router();
 
-// ---------- Upload ----------
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 20 * 1024 * 1024 },
+// ========== OpenAI SDK ==========
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+  // organization: process.env.OPENAI_ORG, // opcional
 });
 
-// ---------- Regex & utils de parsing ----------
-const NUM_UNIT = /([+-]?\d+(?:[.,]\d+)?)(?:\s*)([%a-zA-Z/µμ]+)?/;
-const MANY_SPACES = /\s{2,}/;
-const normDec = (s: string) => s.replace(/,/g, ".");
+// ========== Tipos ==========
+type PlanKeys = "supplements" | "fitoterapia" | "dieta" | "exercicios" | "estiloVida";
 
-// ---------- Helpers gerais ----------
-async function resolveTemplatePath(): Promise<string> {
-  // Tenta em várias localizações — inclusive variável de ambiente
-  const fromEnv = process.env.TEMPLATE_PATH;
-  const candidates = [
-    fromEnv,
-    path.join(process.cwd(), "dist", "assets", "Receituario_Fernando_Fernandes.pdf"),
-    path.join(process.cwd(), "dist", "assets", "receituario.pdf"),
-    path.join(process.cwd(), "assets", "Receituario_Fernando_Fernandes.pdf"),
-    path.join(process.cwd(), "assets", "receituario.pdf"),
-    path.join(__dirname, "..", "..", "assets", "Receituario_Fernando_Fernandes.pdf"),
-    path.join(__dirname, "..", "..", "assets", "receituario.pdf"),
-  ].filter(Boolean) as string[];
-
-  for (const p of candidates) {
-    try {
-      const buf = await fs.readFile(p);
-      if (buf.slice(0, 4).toString() === "%PDF") {
-        console.log("[template] usando:", p, "size:", buf.length);
-        return p;
-      }
-    } catch {}
-  }
-  throw new Error(
-    "Template PDF não encontrado. Configure TEMPLATE_PATH ou copie assets para dist/assets."
-  );
-}
-
-function wrapText(text: string, maxChars = 110) {
-  const parts: string[] = [];
-  let line = "";
-  for (const w of (text || "").split(" ")) {
-    const cand = line ? `${line} ${w}` : w;
-    if (cand.length > maxChars) {
-      if (line) parts.push(line);
-      line = w;
-    } else {
-      line = cand;
-    }
-  }
-  if (line) parts.push(line);
-  return parts;
-}
-
-// ---------- Parsing do texto ----------
-function parseKeyValues(lines: string[]) {
-  const out: Array<{ label: string; value?: number; unit?: string; raw: string }> = [];
-  for (const line of lines) {
-    const m = line.match(/^\s*([^:：]+?)\s*[:：]\s*(.+?)\s*$/);
-    if (!m) continue;
-    const label = m[1].trim();
-    const rhs = m[2].trim();
-    const mu = rhs.match(NUM_UNIT);
-    if (mu) {
-      const value = parseFloat(normDec(mu[1]));
-      const unit = mu[2]?.trim();
-      if (!Number.isNaN(value)) out.push({ label, value, unit, raw: line });
-    } else {
-      out.push({ label, raw: line });
-    }
-  }
-  return out;
-}
-
-function parseTables(lines: string[]) {
-  const tables: Array<{ headers: string[]; rows: string[][]; raw: string[] }> = [];
-  let buffer: string[] = [];
-  const flush = () => {
-    if (buffer.length >= 2) {
-      const hdr = buffer[0].split(MANY_SPACES).map((s) => s.trim());
-      const rows = buffer.slice(1).map((r) => r.split(MANY_SPACES).map((s) => s.trim()));
-      tables.push({ headers: hdr, rows, raw: [...buffer] });
-    }
-    buffer = [];
-  };
-
-  for (const line of lines) {
-    if (MANY_SPACES.test(line)) buffer.push(line);
-    else flush();
-  }
-  flush();
-  return tables;
-}
-
-function tablesToTests(tables: Array<{ headers: string[]; rows: string[][] }>) {
-  const tests: Array<any> = [];
-  for (const t of tables) {
-    const H = t.headers.map((h) => h.toLowerCase());
-    const colIdx = {
-      test: H.findIndex((h) => /(exame|teste|analyte|analito|parametro|item|nome)/.test(h)),
-      result: H.findIndex((h) => /(resultado|result|valor|value)/.test(h)),
-      unit: H.findIndex((h) => /(unidade|unit)/.test(h)),
-      ref: H.findIndex((h) => /(ref|refer|intervalo|range)/.test(h)),
-      flag: H.findIndex((h) => /(flag|obs|interpreta|class)/.test(h)),
-    };
-    for (const row of t.rows) {
-      const label = row[colIdx.test] ?? row[0] ?? "";
-      const resultStr = row[colIdx.result] ?? "";
-      const mu = resultStr.match(NUM_UNIT);
-      const value = mu ? parseFloat(normDec(mu[1])) : undefined;
-      const unit = mu?.[2];
-      const ref = row[colIdx.ref];
-      const flag = row[colIdx.flag];
-      if (label) {
-        tests.push({
-          label,
-          value: Number.isFinite(value as number) ? value : undefined,
-          unit,
-          refRange: ref,
-          flag,
-          rowText: row.join(" | "),
-          source: "table",
-          confidence: 0.85,
-        });
-      }
-    }
-  }
-  return tests;
-}
-
-function guessMeta(text: string) {
-  const meta: Record<string, string> = {};
-  const name = text.match(/Paciente\s*[:：]\s*(.+)/i);
-  const date = text.match(
-    /(Coleta|Emissão|Emitido|Data)\s*[:：]\s*([0-9]{1,2}[\/\-\.][0-9]{1,2}[\/\-\.][0-9]{2,4})/i
-  );
-  const lab = text.match(/Laborat[oó]rio\s*[:：]\s*(.+)/i);
-  if (name) meta.paciente = name[1].trim();
-  if (date) meta.data = date[2].trim();
-  if (lab) meta.laboratorio = lab[1].trim();
-  return meta;
-}
-
-// ---------- IA: gera sugestões para as 5 seções ----------
-async function aiPlanFromTests(
-  tests: Array<{ label: string; value?: number; unit?: string }>,
-  opts?: { meta?: any; rawText?: string }
-): Promise<{
-  suplementos: string[];
-  fitoterapia_chinesa: string[];
+export interface Plan {
+  supplements: string[];
+  fitoterapia: string[];
   dieta: string[];
   exercicios: string[];
-  meditacao: string[];
-  observacoes: string[];
-}> {
-  if (!process.env.OPENAI_API_KEY) {
-    throw new Error("OPENAI_API_KEY ausente");
-  }
-
-  const system = [
-    "Você é um assistente clínico que gera sugestões EM PORTUGUÊS (Brasil) para um rascunho de receituário.",
-    "Não diagnostique, nem prescreva controlados; apenas sugestões educativas com segurança.",
-    "Use bullet points curtos e práticos; cite faixas comuns e escreva 'ajuste conforme acompanhamento' quando aplicável."
-  ].join(" ");
-
-  const instruction = [
-    "Com base nos exames (tests) a seguir, gere um JSON com as chaves:",
-    "suplementos, fitoterapia_chinesa, dieta, exercicios, meditacao, observacoes.",
-    "Cada chave deve ser um array de strings (bullets).",
-    "Se alguma área não tiver nada específico, devolva bullets genéricos seguros.",
-    "FORMATO ESTRITO: {\"suplementos\":[],\"fitoterapia_chinesa\":[],\"dieta\":[],\"exercicios\":[],\"meditacao\":[],\"observacoes\":[]}"
-  ].join(" ");
-
-  const input = {
-    tests,
-    meta: opts?.meta ?? null,
-    rawTextSnippet: opts?.rawText?.slice(0, 6000) ?? null,
-  };
-
-  const resp = await openai.chat.completions.create({
-    model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-    temperature: 0.2,
-    response_format: { type: "json_object" },
-    messages: [
-      { role: "system", content: system },
-      { role: "user", content: instruction },
-      { role: "user", content: JSON.stringify(input) },
-    ],
-  });
-
-  const content = resp.choices[0]?.message?.content || "{}";
-  let parsed: any = {};
-  try { parsed = JSON.parse(content); } catch {}
-
-  const ensureArr = (x: any) => (Array.isArray(x) ? x.map((s) => String(s)) : []);
-  return {
-    suplementos: ensureArr(parsed.suplementos),
-    fitoterapia_chinesa: ensureArr(parsed.fitoterapia_chinesa),
-    dieta: ensureArr(parsed.dieta),
-    exercicios: ensureArr(parsed.exercicios),
-    meditacao: ensureArr(parsed.meditacao),
-    observacoes: ensureArr(parsed.observacoes),
-  };
+  estiloVida: string[];
 }
 
-// ---------- Router ----------
-const router = Router();
+interface CachePayload {
+  plan: Plan;
+  modelUsed: string;
+  at: number;
+}
 
-/* ==========================
-   1) ANÁLISE (retorna rawText!)
-   ========================== */
-const analisarHandler = async (req: Request, res: Response) => {
+// ========== Mongoose Model ==========
+const ExamSchema = new Schema(
+  {
+    filename: String,
+    mimetype: String,
+    size: Number,
+    hash: { type: String, index: true },
+    text: String,
+    meta: Object,
+  },
+  { timestamps: true }
+);
+type ExamDoc = InferSchemaType<typeof ExamSchema> & { _id: mongoose.Types.ObjectId };
+const Exam = (mongoose.models.Exam as mongoose.Model<ExamDoc>) || mongoose.model<ExamDoc>("Exam", ExamSchema);
+
+// ========== Multer (memória) ==========
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
+});
+
+// ========== Cache simples em memória ==========
+/** key: sha256(text) -> { plan, modelUsed, at } (apenas sucesso da IA) */
+const memCache = new Map<string, CachePayload>();
+
+// ========== Utils ==========
+function examKey(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
+function bufToSha256(buf: Buffer): string {
+  return createHash("sha256").update(buf).digest("hex");
+}
+
+/** Prompt 100% dependente do exame, sem heurísticas internas */
+function montarPrompt(extractedText: string): string {
+  return [
+    "Você é um assistente clínico que cria um PLANO ESTRUTURADO e ESTRITAMENTE PERSONALIZADO a partir do texto de um exame laboratorial.",
+    "Regra: use SOMENTE as informações presentes no exame fornecido; não invente marcadores que não estejam no texto.",
+    "Inclua recomendações APENAS quando houver indícios no exame. Se um marcador estiver dentro da referência, não recomende nada sobre ele.",
+    'Formato de saída: JSON VÁLIDO exatamente com as chaves {"supplements":[],"fitoterapia":[],"dieta":[],"exercicios":[],"estiloVida":[]}.',
+    "Cada item deve ser uma string curta, prática e específica ao achado do exame.",
+    "Se não houver nada a recomendar em alguma seção, retorne um array vazio para aquela chave.",
+    "",
+    "Exame (texto bruto, use como única fonte):",
+    extractedText.slice(0, 18000),
+  ].join("\n");
+}
+
+/** Tenta JSON direto; sem regras — se não for JSON, tenta capturar listas se o modelo soltou seções. */
+function parsePlano(modelOutput: string): Plan {
+  // 1) JSON direto
   try {
-    if (!req.file) return res.status(400).json({ error: "Arquivo não enviado (campo 'exame')." });
-
-    const parsed = await pdfParse(req.file.buffer);
-    const text = (parsed.text || "").replace(/\r/g, "");
-    const lines = text.split("\n").map((s: string) => s.trim()).filter(Boolean);
-
-    const meta = guessMeta(text);
-    const kv = parseKeyValues(lines).map((k) => ({
-      ...k,
-      confidence: 0.7,
-      source: "key:value",
-    }));
-    const tables = parseTables(lines);
-    const tableTests = tablesToTests(tables);
-
-    const tests = [
-      ...tableTests,
-      ...kv.map((k) => ({
-        label: k.label,
-        value: k.value,
-        unit: k.unit,
-        rowText: k.raw,
-        source: k.source,
-        confidence: k.confidence,
-      })),
+    const maybe = JSON.parse(modelOutput) as Partial<Record<PlanKeys, unknown>>;
+    const shape: Plan = {
+      supplements: Array.isArray(maybe?.supplements) ? (maybe.supplements as string[]) : [],
+      fitoterapia: Array.isArray(maybe?.fitoterapia) ? (maybe.fitoterapia as string[]) : [],
+      dieta: Array.isArray(maybe?.dieta) ? (maybe.dieta as string[]) : [],
+      exercicios: Array.isArray(maybe?.exercicios) ? (maybe.exercicios as string[]) : [],
+      estiloVida: Array.isArray(maybe?.estiloVida) ? (maybe.estiloVida as string[]) : [],
+    };
+    return shape;
+  } catch {
+    // 2) Se não veio JSON, tenta extrair listas por seções rotuladas
+    const out: Plan = { supplements: [], fitoterapia: [], dieta: [], exercicios: [], estiloVida: [] };
+    const sections: Array<{ key: PlanKeys; rx: RegExp; bodyIndex?: number }> = [
+      { key: "supplements", rx: /(suplementos?|supplements?)\s*[:\-]\s*([\s\S]+?)(?:\n\n|$)/i, bodyIndex: 2 },
+      { key: "fitoterapia", rx: /(fitoterapia|fitotherap(y|ia))\s*[:\-]\s*([\s\S]+?)(?:\n\n|$)/i, bodyIndex: 2 },
+      { key: "dieta", rx: /(dieta|diet)\s*[:\-]\s*([\s\S]+?)(?:\n\n|$)/i, bodyIndex: 2 },
+      { key: "exercicios", rx: /(exerc[ií]cios?|exercises?)\s*[:\-]\s*([\s\S]+?)(?:\n\n|$)/i, bodyIndex: 2 },
+      { key: "estiloVida", rx: /(estilo\s*de\s*vida|lifestyle)\s*[:\-]\s*([\s\S]+?)(?:\n\n|$)/i, bodyIndex: 2 },
     ];
+    for (const s of sections) {
+      const m = modelOutput.match(s.rx);
+      const body = m?.[s.bodyIndex ?? 2];
+      if (body) {
+        body
+          .split(/\n|•|\-/)
+          .map((x: string) => x.trim())
+          .filter((x: string) => Boolean(x))
+          .forEach((x: string) => out[s.key].push(x));
+      }
+    }
+    return out;
+  }
+}
 
-    const maybeScanned = text.trim().length < 50;
+/** Chama a IA; distingue 429 quota vs rate-limit; sem fallback de regras */
+async function safeSuggest(prompt: string, model = process.env.SUGGEST_MODEL || "gpt-4o-mini"): Promise<
+  | { ok: true; data: string; modelUsed: string }
+  | { ok: false; kind: "quota" | "rate" | "other"; requestId?: string; retryAfter?: string; message?: string }
+> {
+  try {
+    const r = await openai.chat.completions.create({
+      model,
+      temperature: 0.2,
+      // Se suportado na sua conta, force JSON:
+      // response_format: { type: "json_object" } as any,
+      messages: [
+        { role: "system", content: "Responda SOMENTE com JSON válido." },
+        { role: "user", content: prompt },
+      ],
+    });
+    const content = r.choices?.[0]?.message?.content ?? "";
+    return { ok: true, data: content, modelUsed: model };
+  } catch (err: unknown) {
+    // Type guard leve para APIError
+    const e = err as Partial<APIError> & {
+      status?: number;
+      code?: string;
+      type?: string;
+      requestID?: string;
+      error?: { code?: string; type?: string };
+      headers?: Headers | { get?(k: string): string | undefined };
+      message?: string;
+    };
+
+    const status = e?.status;
+    const code = e?.error?.code || e?.code;
+    const type = e?.error?.type || e?.type;
+    const requestId = e?.requestID;
+
+    if (status === 429 && (code === "insufficient_quota" || type === "insufficient_quota")) {
+      return { ok: false, kind: "quota", requestId };
+    }
+    if (status === 429) {
+      const retryAfter =
+        (typeof e?.headers?.get === "function" && e.headers.get("retry-after")) ||
+        (typeof (e?.headers as any)?.["retry-after"] === "string" ? (e as any).headers["retry-after"] : undefined);
+      return { ok: false, kind: "rate", requestId, retryAfter };
+    }
+    return { ok: false, kind: "other", requestId, message: e?.message || "AI error" };
+  }
+}
+
+// ========== Rota: upload de PDF ==========
+router.post("/upload", upload.single("exame"), async (req: Request, res: Response) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "Selecione um PDF no campo 'exame'." });
+    if (req.file.mimetype !== "application/pdf") {
+      return res.status(400).json({ error: "Arquivo precisa ser PDF." });
+    }
+
+    const fileHash = bufToSha256(req.file.buffer);
+    const parsed: any = await pdfParse(req.file.buffer);
+    const extractedText: string = (parsed.text || "").trim();
+
+    if (!extractedText) return res.status(422).json({ error: "Não foi possível extrair texto do PDF." });
+
+    // Upsert por hash (evita duplicata)
+    const doc = await Exam.findOneAndUpdate(
+      { hash: fileHash },
+      {
+        filename: req.file.originalname,
+        mimetype: req.file.mimetype,
+        size: req.file.size,
+        hash: fileHash,
+        text: extractedText,
+        meta: { pages: parsed.numpages, info: parsed.info || null },
+      },
+      { new: true, upsert: true, setDefaultsOnInsert: true }
+    );
 
     return res.json({
       ok: true,
-      meta,
-      maybeScanned,
-      textSnippet: text.slice(0, 1500),
-      tests,
-      tablesRaw: tables,
-      rawText: text, // <<--- IMPORTANTE para o app navegar com o texto
+      examId: doc._id,
+      hash: fileHash,
+      pages: parsed.numpages,
+      filename: req.file.originalname,
     });
-  } catch (e: any) {
-    console.error("Erro /analisar-exame:", e);
-    return res.status(500).json({ error: e?.message || String(e) });
-  }
-};
-
-/* ==========================
-   2) GERAÇÃO DE PDF
-   ========================== */
-const gerarHandler = async (req: Request, res: Response) => {
-  try {
-    // a) Pega tests do cliente (se vierem)
-    let testsFromClient: Array<{ label: string; value?: number; unit?: string }> | null = null;
-    if (req.body?.tests) {
-      try {
-        testsFromClient = JSON.parse(String(req.body.tests));
-      } catch {
-        return res.status(400).json({ error: "Formato inválido de 'tests' (JSON)." });
-      }
-    }
-
-    // b) Se não vier tests, tenta extrair rapidamente do PDF
-    let rawText = "";
-    if (!testsFromClient && req.file) {
-      const parsed = await pdfParse(req.file.buffer);
-      rawText = (parsed.text || "").replace(/\r/g, "");
-      const lines = rawText.split("\n").map((s: string) => s.trim()).filter(Boolean);
-      const kv = parseKeyValues(lines).map((k) => ({
-        label: k.label,
-        value: k.value,
-        unit: k.unit,
-      }));
-      const tables = parseTables(lines);
-      const tableTests = tablesToTests(tables);
-      testsFromClient = [...tableTests, ...kv];
-    }
-
-    if (!testsFromClient) {
-      return res.status(400).json({ error: "Envie 'tests' (JSON) ou o arquivo do exame." });
-    }
-
-    // c) IA (opcional)
-    let ai: {
-      suplementos: string[];
-      fitoterapia_chinesa: string[];
-      dieta: string[];
-      exercicios: string[];
-      meditacao: string[];
-      observacoes: string[];
-    } | null = null;
-
-    const useAI = String(req.query.useAI || "").trim() === "1" || !!process.env.OPENAI_API_KEY;
-
-    if (useAI && process.env.OPENAI_API_KEY) {
-      try {
-        ai = await aiPlanFromTests(
-          testsFromClient.map((t) => ({ label: t.label, value: t.value, unit: t.unit })),
-          { rawText }
-        );
-      } catch (err) {
-        console.error("Falha IA:", err);
-        ai = null;
-      }
-    }
-
-    // d) Carrega template
-    const tplPath = await resolveTemplatePath();
-    const tplBytes = await fs.readFile(tplPath);
-    const pdfDoc = await PDFDocument.load(tplBytes);
-    const page = pdfDoc.getPages()[0];
-    const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-    const bold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-
-    // e) Escreve conteúdo
-    let x = 40,
-      y = page.getHeight() - 110;
-    const draw = (txt: string, f = font, size = 10) => {
-      page.drawText(txt, { x, y, size, font: f, color: rgb(0, 0, 0) });
-      y -= size + 3;
-    };
-
-    draw("Condutas (rascunho automático) — revisar antes de prescrever", bold, 12);
-    y -= 3;
-
-    // Resumo dos tests
-    draw("Observações do exame:", bold, 11);
-    const summarizable = testsFromClient
-      .slice(0, 18)
-      .map((t) => `• ${t.label}${t.value != null ? `: ${t.value}` : ""}${t.unit ? ` ${t.unit}` : ""}`)
-      .join("  |  ");
-    for (const line of wrapText(summarizable || "• Sem itens estruturados.", 110)) draw(line);
-
-    const S =
-      ai || {
-        suplementos: ["(preencha conforme avaliação clínica)"],
-        fitoterapia_chinesa: ["(preencha conforme avaliação)"],
-        dieta: ["Padrão anti-inflamatório básico.", "Baixo IG; reduzir ultraprocessados."],
-        exercicios: ["Aeróbico 150 min/semana.", "Resistido 2–3x/semana."],
-        meditacao: ["Mindfulness 10–15 min/dia.", "Higiene do sono."],
-        observacoes: [],
-      };
-
-    function drawSection(title: string, items: string[]) {
-      y -= 6;
-      draw(`${title}:`, bold, 11);
-      const list = items?.length ? items : ["(sem sugestões no momento)"];
-      for (const it of list) for (const line of wrapText(`• ${it}`, 110)) draw(line);
-    }
-
-    drawSection("Suplementos", S.suplementos);
-    drawSection("Fitoterapia Chinesa", S.fitoterapia_chinesa);
-    drawSection("Dieta", S.dieta);
-    drawSection("Exercícios", S.exercicios);
-    drawSection("Meditação", S.meditacao);
-
-    if (S.observacoes?.length) drawSection("Observações", S.observacoes);
-
-    y -= 8;
-    for (const line of wrapText(
-      "Nota: conteúdo gerado por IA para apoio, não substitui avaliação e prescrição médica.",
-      110
-    )) {
-      page.drawText(line, { x, y, size: 9, font });
-      y -= 12;
-    }
-
-    const out = await pdfDoc.save();
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `attachment; filename="Receituario_${Date.now()}.pdf"`);
-    return res.status(200).send(Buffer.from(out));
-  } catch (e: any) {
-    console.error("Erro /gerar-receituario:", e);
-    return res.status(500).json({ error: e?.message || String(e) });
-  }
-};
-
-/* ==========================
-   3) SUGESTÕES EM JSON (para o app)
-   ========================== */
-router.post("/suggest", async (req: Request, res: Response) => {
-  try {
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(400).json({ error: "OPENAI_API_KEY ausente" });
-    }
-
-    // Aceita tests (array) *ou* rawExamText (string)
-    let tests: Array<{ label: string; value?: number; unit?: string }> | null = null;
-    let rawText = "";
-
-    if (Array.isArray(req.body?.tests)) {
-      tests = req.body.tests;
-    } else if (typeof req.body?.tests === "string") {
-      try { tests = JSON.parse(req.body.tests); } catch {
-        return res.status(400).json({ error: "Formato inválido de 'tests' (JSON string)." });
-      }
-    }
-
-    if (!tests && typeof req.body?.rawExamText === "string") {
-      rawText = String(req.body.rawExamText || "").replace(/\r/g, "");
-      const lines = rawText.split("\n").map((s: string) => s.trim()).filter(Boolean);
-      const kv = parseKeyValues(lines).map((k) => ({ label: k.label, value: k.value, unit: k.unit }));
-      const tables = parseTables(lines);
-      const tableTests = tablesToTests(tables);
-      tests = [...tableTests, ...kv];
-    }
-
-    if (!tests || tests.length === 0) {
-      return res.status(400).json({ error: "Envie 'rawExamText' (string) ou 'tests' (array)." });
-    }
-
-    const ai = await aiPlanFromTests(
-      tests.map((t) => ({ label: t.label, value: t.value, unit: t.unit })),
-      { rawText }
-    );
-
-    const suggestions = {
-      supplements: ai.suplementos ?? [],
-      fitoterapia: ai.fitoterapia_chinesa ?? [],
-      dieta: ai.dieta ?? [],
-      exercicios: ai.exercicios ?? [],
-      estiloVida: [...(ai.meditacao ?? []), ...(ai.observacoes ?? [])],
-    };
-
-    return res.json({ suggestions });
-  } catch (e: any) {
-    console.error("Erro /suggest:", e);
-    return res.status(500).json({ error: e?.message || String(e) });
+  } catch (err) {
+    console.error("Erro /upload:", err);
+    return res.status(500).json({ error: "Falha no upload/análise do PDF." });
   }
 });
 
-// ---------- Rotas (com aliases p/ compatibilidade) ----------
-// análise
-router.post("/analisar-exame", upload.single("exame"), analisarHandler);
-router.post("/analisar-exame-universal", upload.single("exame"), analisarHandler);
+// ========== Rota: obter exame ==========
+router.get("/exam/:id", async (req: Request, res: Response) => {
+  try {
+    const doc = await Exam.findById(req.params.id).lean();
+    if (!doc) return res.status(404).json({ error: "Exame não encontrado." });
+    res.json({ ok: true, exam: doc });
+  } catch (err) {
+    console.error("Erro /exam/:id", err);
+    res.status(500).json({ error: "Falha ao buscar exame." });
+  }
+});
 
-// geração
-router.post("/gerar-receituario", upload.single("exame"), gerarHandler);
-router.post("/gerar-receituario-universal", upload.single("exame"), gerarHandler);
+// ========== Rota: suggest (IA obrigatória) ==========
+/**
+ * Body aceito:
+ * - { examId: string }  OU
+ * - { extractedText: string }
+ *
+ * Sem regras internas: se a IA não responder, retorna 503 sem fallback.
+ */
+router.post("/suggest", async (req: Request, res: Response) => {
+  try {
+    let extractedText = req.body?.extractedText as string | undefined;
+
+    if (!extractedText && req.body?.examId) {
+      const doc = await Exam.findById(req.body.examId as string).lean();
+      if (!doc) return res.status(404).json({ error: "Exame não encontrado." });
+      extractedText = (doc as any).text as string;
+    }
+    if (!extractedText) {
+      return res.status(400).json({ error: "Forneça 'extractedText' ou 'examId'." });
+    }
+
+    const key = examKey(extractedText);
+
+    // Cache apenas de sucesso anterior (IA)
+    if (memCache.has(key)) {
+      return res.json({ fromCache: true, ...memCache.get(key) });
+    }
+
+    const prompt = montarPrompt(extractedText);
+
+    // 1) Modelo principal
+    let result = await safeSuggest(prompt, process.env.SUGGEST_MODEL || "gpt-4o-mini");
+
+    // 2) Se cota estourou, tenta fallback de MODELO (continua IA), se configurado
+    if (!result.ok && result.kind === "quota" && process.env.SUGGEST_MODEL_FALLBACK) {
+      result = await safeSuggest(prompt, process.env.SUGGEST_MODEL_FALLBACK);
+    }
+
+    // 3) Sucesso IA → parse + cache
+    if (result.ok) {
+      const plan = parsePlano(result.data);
+      const payload: CachePayload = { plan, modelUsed: result.modelUsed, at: Date.now() };
+      memCache.set(key, payload);
+      return res.json(payload);
+    }
+
+    // 4) Falhou IA → SEM fallback; retorna erro claro
+    const motivo =
+      !result.ok && result.kind === "quota"
+        ? "quota_exceeded"
+        : !result.ok && result.kind === "rate"
+        ? "rate_limited"
+        : "ai_error";
+
+    return res.status(503).json({
+      error: "AI temporarily unavailable",
+      reason: motivo,
+      requestId: !result.ok ? result.requestId : undefined,
+      retryAfter: !result.ok ? result.retryAfter : undefined,
+      message: !result.ok && result.kind === "other" ? result.message : undefined,
+    });
+  } catch (err) {
+    console.error("Erro /suggest:", err);
+    return res.status(500).json({ error: "Falha ao gerar sugestões." });
+  }
+});
 
 export default router;
