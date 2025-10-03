@@ -10,7 +10,7 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "10mb" })); // JSON para /analisar-exame-json e /receituario/pdf
 app.use(express.urlencoded({ extended: true }));
 
 // Mongo
@@ -24,11 +24,11 @@ mongoose
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.get("/health", (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-// Health da IA
+// Health IA
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 app.get("/health-ia", async (_req, res) => {
   const hasKey = Boolean(process.env.OPENAI_API_KEY);
-  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+  const model = process.env.SUGGEST_MODEL || "gpt-4o-mini";
   if (!hasKey) return res.status(503).json({ ok: false, hasKey, model, error: "OPENAI_API_KEY ausente" });
   try {
     const r = await openai.chat.completions.create({
@@ -42,8 +42,9 @@ app.get("/health-ia", async (_req, res) => {
   }
 });
 
-// API
+// API (com prefixo) e também sem prefixo (compat)
 app.use("/api", uploadRoutes);
+app.use("/", uploadRoutes);
 
 // 404
 app.use((req, res) => res.status(404).json({ error: `Rota não encontrada: ${req.method} ${req.originalUrl}` }));
