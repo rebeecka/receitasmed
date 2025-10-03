@@ -1,23 +1,26 @@
 // backend/src/routes/uploadRoutes.ts
 import express, { Request, Response } from "express";
 import multer from "multer";
-// @ts-ignore - pdf-parse não exporta tipos completos por padrão
-import pdfParse from "pdf-parse";
+import _pdfParse from "pdf-parse";
 import { createHash } from "node:crypto";
 import mongoose, { Schema, InferSchemaType } from "mongoose";
 import OpenAI, { APIError } from "openai";
 
 const router = express.Router();
 
-// ========== OpenAI SDK ==========
+// -------- OpenAI --------
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
   // organization: process.env.OPENAI_ORG, // opcional
 });
 
-// ========== Tipos ==========
-type PlanKeys = "supplements" | "fitoterapia" | "dieta" | "exercicios" | "estiloVida";
+// -------- pdf-parse compat (CJS/ESM) --------
+const pdfParse: (data: Buffer) => Promise<{ text: string; numpages: number; info: any }> =
+ 
+  (_pdfParse as any)?.default ?? (_pdfParse as any);
 
+// -------- Tipos --------
+type PlanKeys = "supplements" | "fitoterapia" | "dieta" | "exercicios" | "estiloVida";
 export interface Plan {
   supplements: string[];
   fitoterapia: string[];
@@ -25,14 +28,13 @@ export interface Plan {
   exercicios: string[];
   estiloVida: string[];
 }
-
 interface CachePayload {
   plan: Plan;
   modelUsed: string;
   at: number;
 }
 
-// ========== Mongoose Model ==========
+// -------- Mongoose Model --------
 const ExamSchema = new Schema(
   {
     filename: String,
@@ -45,19 +47,20 @@ const ExamSchema = new Schema(
   { timestamps: true }
 );
 type ExamDoc = InferSchemaType<typeof ExamSchema> & { _id: mongoose.Types.ObjectId };
-const Exam = (mongoose.models.Exam as mongoose.Model<ExamDoc>) || mongoose.model<ExamDoc>("Exam", ExamSchema);
+const Exam =
+  (mongoose.models.Exam as mongoose.Model<ExamDoc>) ||
+  mongoose.model<ExamDoc>("Exam", ExamSchema);
 
-// ========== Multer (memória) ==========
+// -------- Multer (memória) --------
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
 });
 
-// ========== Cache simples em memória ==========
-/** key: sha256(text) -> { plan, modelUsed, at } (apenas sucesso da IA) */
+// -------- Cache em memória (apenas sucesso IA) --------
 const memCache = new Map<string, CachePayload>();
 
-// ========== Utils ==========
+// -------- Utils --------
 function examKey(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
@@ -65,7 +68,6 @@ function bufToSha256(buf: Buffer): string {
   return createHash("sha256").update(buf).digest("hex");
 }
 
-/** Prompt 100% dependente do exame, sem heurísticas internas */
 function montarPrompt(extractedText: string): string {
   return [
     "Você é um assistente clínico que cria um PLANO ESTRUTURADO e ESTRITAMENTE PERSONALIZADO a partir do texto de um exame laboratorial.",
@@ -80,9 +82,7 @@ function montarPrompt(extractedText: string): string {
   ].join("\n");
 }
 
-/** Tenta JSON direto; sem regras — se não for JSON, tenta capturar listas se o modelo soltou seções. */
 function parsePlano(modelOutput: string): Plan {
-  // 1) JSON direto
   try {
     const maybe = JSON.parse(modelOutput) as Partial<Record<PlanKeys, unknown>>;
     const shape: Plan = {
@@ -94,7 +94,7 @@ function parsePlano(modelOutput: string): Plan {
     };
     return shape;
   } catch {
-    // 2) Se não veio JSON, tenta extrair listas por seções rotuladas
+    // Se não veio JSON, tenta extrair por seções (sem regras determinísticas)
     const out: Plan = { supplements: [], fitoterapia: [], dieta: [], exercicios: [], estiloVida: [] };
     const sections: Array<{ key: PlanKeys; rx: RegExp; bodyIndex?: number }> = [
       { key: "supplements", rx: /(suplementos?|supplements?)\s*[:\-]\s*([\s\S]+?)(?:\n\n|$)/i, bodyIndex: 2 },
@@ -118,8 +118,10 @@ function parsePlano(modelOutput: string): Plan {
   }
 }
 
-/** Chama a IA; distingue 429 quota vs rate-limit; sem fallback de regras */
-async function safeSuggest(prompt: string, model = process.env.SUGGEST_MODEL || "gpt-4o-mini"): Promise<
+async function safeSuggest(
+  prompt: string,
+  model = process.env.SUGGEST_MODEL || "gpt-4o-mini"
+): Promise<
   | { ok: true; data: string; modelUsed: string }
   | { ok: false; kind: "quota" | "rate" | "other"; requestId?: string; retryAfter?: string; message?: string }
 > {
@@ -127,7 +129,7 @@ async function safeSuggest(prompt: string, model = process.env.SUGGEST_MODEL || 
     const r = await openai.chat.completions.create({
       model,
       temperature: 0.2,
-      // Se suportado na sua conta, force JSON:
+      // Se sua conta permitir, use:
       // response_format: { type: "json_object" } as any,
       messages: [
         { role: "system", content: "Responda SOMENTE com JSON válido." },
@@ -137,7 +139,6 @@ async function safeSuggest(prompt: string, model = process.env.SUGGEST_MODEL || 
     const content = r.choices?.[0]?.message?.content ?? "";
     return { ok: true, data: content, modelUsed: model };
   } catch (err: unknown) {
-    // Type guard leve para APIError
     const e = err as Partial<APIError> & {
       status?: number;
       code?: string;
@@ -166,21 +167,31 @@ async function safeSuggest(prompt: string, model = process.env.SUGGEST_MODEL || 
   }
 }
 
-// ========== Rota: upload de PDF ==========
+// -------- /upload --------
 router.post("/upload", upload.single("exame"), async (req: Request, res: Response) => {
   try {
     if (!req.file) return res.status(400).json({ error: "Selecione um PDF no campo 'exame'." });
+    if (!req.file.buffer || !Buffer.isBuffer(req.file.buffer)) {
+      return res.status(400).json({ error: "Arquivo inválido (sem buffer)." });
+    }
+
     if (req.file.mimetype !== "application/pdf") {
-      return res.status(400).json({ error: "Arquivo precisa ser PDF." });
+      console.warn("[upload] MIME recebido:", req.file.mimetype);
+    }
+
+    const parsed = await pdfParse(req.file.buffer);
+    console.log("[upload] pdf-parse ok. pages:", parsed?.numpages);
+
+    const extractedText: string = (parsed?.text || "").trim();
+    if (!extractedText) {
+      return res.status(422).json({
+        error: "PDF sem texto extraível (provavelmente escaneado).",
+        hint: "Peça ao laboratório um PDF exportado com texto ou habilite OCR no backend.",
+        pages: parsed?.numpages ?? undefined,
+      });
     }
 
     const fileHash = bufToSha256(req.file.buffer);
-    const parsed: any = await pdfParse(req.file.buffer);
-    const extractedText: string = (parsed.text || "").trim();
-
-    if (!extractedText) return res.status(422).json({ error: "Não foi possível extrair texto do PDF." });
-
-    // Upsert por hash (evita duplicata)
     const doc = await Exam.findOneAndUpdate(
       { hash: fileHash },
       {
@@ -189,7 +200,7 @@ router.post("/upload", upload.single("exame"), async (req: Request, res: Respons
         size: req.file.size,
         hash: fileHash,
         text: extractedText,
-        meta: { pages: parsed.numpages, info: parsed.info || null },
+        meta: { pages: parsed?.numpages, info: (parsed as any)?.info || null },
       },
       { new: true, upsert: true, setDefaultsOnInsert: true }
     );
@@ -198,8 +209,10 @@ router.post("/upload", upload.single("exame"), async (req: Request, res: Respons
       ok: true,
       examId: doc._id,
       hash: fileHash,
-      pages: parsed.numpages,
+      pages: parsed?.numpages,
       filename: req.file.originalname,
+      textPreview: extractedText.slice(0, 4000),
+      textLength: extractedText.length,
     });
   } catch (err) {
     console.error("Erro /upload:", err);
@@ -207,7 +220,7 @@ router.post("/upload", upload.single("exame"), async (req: Request, res: Respons
   }
 });
 
-// ========== Rota: obter exame ==========
+// -------- /exam/:id --------
 router.get("/exam/:id", async (req: Request, res: Response) => {
   try {
     const doc = await Exam.findById(req.params.id).lean();
@@ -219,13 +232,10 @@ router.get("/exam/:id", async (req: Request, res: Response) => {
   }
 });
 
-// ========== Rota: suggest (IA obrigatória) ==========
+// -------- /suggest --------
 /**
- * Body aceito:
- * - { examId: string }  OU
- * - { extractedText: string }
- *
- * Sem regras internas: se a IA não responder, retorna 503 sem fallback.
+ * Body: { examId } OU { extractedText }
+ * Sem regras internas. Se a IA não responder, retorna 503.
  */
 router.post("/suggest", async (req: Request, res: Response) => {
   try {
@@ -241,23 +251,18 @@ router.post("/suggest", async (req: Request, res: Response) => {
     }
 
     const key = examKey(extractedText);
-
-    // Cache apenas de sucesso anterior (IA)
     if (memCache.has(key)) {
       return res.json({ fromCache: true, ...memCache.get(key) });
     }
 
     const prompt = montarPrompt(extractedText);
 
-    // 1) Modelo principal
     let result = await safeSuggest(prompt, process.env.SUGGEST_MODEL || "gpt-4o-mini");
 
-    // 2) Se cota estourou, tenta fallback de MODELO (continua IA), se configurado
     if (!result.ok && result.kind === "quota" && process.env.SUGGEST_MODEL_FALLBACK) {
       result = await safeSuggest(prompt, process.env.SUGGEST_MODEL_FALLBACK);
     }
 
-    // 3) Sucesso IA → parse + cache
     if (result.ok) {
       const plan = parsePlano(result.data);
       const payload: CachePayload = { plan, modelUsed: result.modelUsed, at: Date.now() };
@@ -265,7 +270,6 @@ router.post("/suggest", async (req: Request, res: Response) => {
       return res.json(payload);
     }
 
-    // 4) Falhou IA → SEM fallback; retorna erro claro
     const motivo =
       !result.ok && result.kind === "quota"
         ? "quota_exceeded"
