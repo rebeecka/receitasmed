@@ -2,17 +2,19 @@
   "name": "receitasmed-backend",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.0.0" },
+  "engines": { "node": "22.16.0" },
   "scripts": {
+    "prebuild": "node scripts/verify-mongoose.js",
     "build": "tsc && cp -R assets dist/assets || true",
     "start": "node dist/server.js",
-    "dev": "tsx src/server.ts"
+    "dev": "tsx src/server.ts",
+    "postinstall": "node scripts/verify-mongoose.js || true"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "mongoose": "8.6.0",
+    "mongoose": "8.8.4",
     "multer": "1.4.5-lts.1",
     "openai": "^4.63.0",
     "pdf-parse": "^1.1.1",
@@ -26,5 +28,8 @@
     "@types/pdfkit": "0.13.6",
     "tsx": "^4.15.7",
     "typescript": "^5.5.4"
+  },
+  "resolutions": {
+    "mongoose": "8.8.4"
   }
 }
