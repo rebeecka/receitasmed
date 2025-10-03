@@ -1,29 +1,22 @@
-// backend/src/routes/suggest.ts
-import { Router, Request, Response } from "express";
-import { suggestFromExam } from "../lib/suggestFromExam";
+import { Router } from "express";
+import { suggestFromExamLLM } from "../lib/suggestFromExam";
 
-const router = Router();
+export const suggestRouter = Router();
 
 /**
- * POST /suggest-from-exam
- * Body: { rawText?: string }
+ * POST /api/suggest
+ * body: { rawExamText: string, patientName?: string }
  */
-router.post("/suggest-from-exam", (req: Request, res: Response) => {
+suggestRouter.post("/", async (req, res) => {
   try {
-    const body = (req.body ?? {}) as Record<string, unknown>;
-
-    // validação leve: rawText opcional e deve ser string se vier
-    if (body.rawText !== undefined && typeof body.rawText !== "string") {
-      return res.status(400).json({ error: "invalid_body", detail: "`rawText` must be a string" });
+    const { rawExamText, patientName } = req.body || {};
+    if (!rawExamText || typeof rawExamText !== "string") {
+      return res.status(400).json({ error: "rawExamText vazio ou inválido" });
     }
-
-    const rawText = (body.rawText as string) ?? "";
-    const plan = suggestFromExam(rawText);
-    return res.json(plan);
-  } catch (err) {
-    console.error("suggest-from-exam error:", err);
-    return res.status(500).json({ error: "internal_error" });
+    const suggestions = await suggestFromExamLLM(rawExamText, patientName);
+    res.json({ suggestions });
+  } catch (e: any) {
+    console.error("suggest error:", e);
+    res.status(500).json({ error: e?.message || "Erro interno" });
   }
 });
-
-export default router;

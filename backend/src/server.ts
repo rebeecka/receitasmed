@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 import mongoose from "mongoose";
 import router from "./routes/uploadRoutes";
 import OpenAI from "openai";
-
+import suggestRouter from "./routes/suggest";
 dotenv.config();
 
 const app = express();
@@ -12,6 +12,7 @@ const app = express();
 // --- Middlewares básicos ---
 app.use(cors()); // se quiser, restrinja com { origin: ["seu-app://", "https://..."] }
 app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
 // --- Conexão com MongoDB ---
 const mongoURI =
@@ -57,7 +58,7 @@ app.get("/health-ia", async (_req, res) => {
 //  - /analisar-exame  e  /analisar-exame-universal
 //  - /gerar-receituario  e  /gerar-receituario-universal
 app.use("/", router);
-
+app.use(suggestRouter);
 // --- 404 sempre em JSON (evita HTML no Render/Express) ---
 app.use((req, res) => {
   res.status(404).json({
