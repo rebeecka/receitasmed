@@ -2,33 +2,34 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import mongoose from "mongoose";
-import router from "./routes/uploadRoutes";
+import router from "./routes/uploadRoutes";      // deve expor /analisar-exame, /gerar-receituario, etc (sem /api)
+import { suggestRouter } from "./routes/suggest"; // deve expor /suggest (sem /api)
 import OpenAI from "openai";
-import { suggestRouter } from "./routes/suggest";
+
 dotenv.config();
 
 const app = express();
 
-// --- Middlewares básicos ---
-app.use(cors()); // se quiser, restrinja com { origin: ["seu-app://", "https://..."] }
-app.use(express.json());
-app.use(express.json({ limit: "1mb" }));
+// --- Middlewares (ANTES das rotas) ---
+app.use(cors());
+app.use(express.json({ limit: "5mb" }));
+app.use(express.urlencoded({ extended: true }));
 
-// --- Conexão com MongoDB ---
+// --- Mongo ---
 const mongoURI =
   process.env.MONGO_URI ||
   "mongodb+srv://rebecca:R39716938a@cluster0.mb29cqx.mongodb.net/receitasmed_db?retryWrites=true&w=majority";
 
- mongoose
-    .connect(mongoURI)
-    .then(() => console.log("✅ MongoDB conectado"))
-    .catch((err) => console.error("❌ Erro ao conectar no MongoDB:", err));
+mongoose
+  .connect(mongoURI)
+  .then(() => console.log("✅ MongoDB conectado"))
+  .catch((err) => console.error("❌ Erro ao conectar no MongoDB:", err));
 
-// --- Health básicos ---
+// --- Health ---
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.get("/health", (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-// --- Health da IA: confirma chave e modelo funcionando ---
+// --- Health da IA ---
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 app.get("/health-ia", async (_req, res) => {
   try {
@@ -54,23 +55,18 @@ app.get("/health-ia", async (_req, res) => {
   }
 });
 
-// --- Rotas principais (IA + PDF)
-//  - /analisar-exame  e  /analisar-exame-universal
-//  - /gerar-receituario  e  /gerar-receituario-universal
-app.use("/", router);
-app.use(suggestRouter);
-app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: true }));
+// --- ROTAS PRINCIPAIS (Monte com prefixo /api) ---
+app.use("/api", router);         // <- agora /api/analisar-exame, /api/gerar-receituario, etc.
+app.use("/api", suggestRouter);  // <- agora /api/suggest
 
-
-// --- 404 sempre em JSON (evita HTML no Render/Express) ---
+// --- 404 JSON ---
 app.use((req, res) => {
   res.status(404).json({
     error: `Rota não encontrada: ${req.method} ${req.originalUrl}`,
   });
 });
 
-// --- Handler de erros em JSON ---
+// --- Erros ---
 app.use((err: any, _req: any, res: any, _next: any) => {
   console.error("Unhandled error:", err);
   res.status(500).json({ error: err?.message || "Erro interno" });
