@@ -8,18 +8,17 @@ import OpenAI, { APIError } from "openai";
 
 const router = express.Router();
 
-// -------- OpenAI --------
+/* ------------------------- OpenAI ------------------------- */
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
-  // organization: process.env.OPENAI_ORG, // opcional
 });
 
-// -------- pdf-parse compat (CJS/ESM) --------
+/* --------- pdf-parse compat (funciona em TS/ESM e CJS) --------- */
 const pdfParse: (data: Buffer) => Promise<{ text: string; numpages: number; info: any }> =
  
   (_pdfParse as any)?.default ?? (_pdfParse as any);
 
-// -------- Tipos --------
+/* ------------------------- Tipos ------------------------- */
 type PlanKeys = "supplements" | "fitoterapia" | "dieta" | "exercicios" | "estiloVida";
 export interface Plan {
   supplements: string[];
@@ -34,7 +33,7 @@ interface CachePayload {
   at: number;
 }
 
-// -------- Mongoose Model --------
+/* ------------------------- Mongoose ------------------------- */
 const ExamSchema = new Schema(
   {
     filename: String,
@@ -51,23 +50,22 @@ const Exam =
   (mongoose.models.Exam as mongoose.Model<ExamDoc>) ||
   mongoose.model<ExamDoc>("Exam", ExamSchema);
 
-// -------- Multer (memória) --------
+/* ------------------------- Multer (memória) ------------------------- */
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
 });
 
-// -------- Cache em memória (apenas sucesso IA) --------
+/* ------------------------- Cache (só sucesso IA) ------------------------- */
 const memCache = new Map<string, CachePayload>();
 
-// -------- Utils --------
+/* ------------------------- Utils ------------------------- */
 function examKey(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 function bufToSha256(buf: Buffer): string {
   return createHash("sha256").update(buf).digest("hex");
 }
-
 function montarPrompt(extractedText: string): string {
   return [
     "Você é um assistente clínico que cria um PLANO ESTRUTURADO e ESTRITAMENTE PERSONALIZADO a partir do texto de um exame laboratorial.",
@@ -81,7 +79,6 @@ function montarPrompt(extractedText: string): string {
     extractedText.slice(0, 18000),
   ].join("\n");
 }
-
 function parsePlano(modelOutput: string): Plan {
   try {
     const maybe = JSON.parse(modelOutput) as Partial<Record<PlanKeys, unknown>>;
@@ -117,7 +114,6 @@ function parsePlano(modelOutput: string): Plan {
     return out;
   }
 }
-
 async function safeSuggest(
   prompt: string,
   model = process.env.SUGGEST_MODEL || "gpt-4o-mini"
@@ -129,8 +125,7 @@ async function safeSuggest(
     const r = await openai.chat.completions.create({
       model,
       temperature: 0.2,
-      // Se sua conta permitir, use:
-      // response_format: { type: "json_object" } as any,
+      // response_format: { type: "json_object" } as any, // use se sua conta permitir
       messages: [
         { role: "system", content: "Responda SOMENTE com JSON válido." },
         { role: "user", content: prompt },
@@ -148,7 +143,6 @@ async function safeSuggest(
       headers?: Headers | { get?(k: string): string | undefined };
       message?: string;
     };
-
     const status = e?.status;
     const code = e?.error?.code || e?.code;
     const type = e?.error?.type || e?.type;
@@ -167,60 +161,146 @@ async function safeSuggest(
   }
 }
 
-// -------- /upload --------
+/* ------------------------- Handler comum (upload buffer) ------------------------- */
+async function handleUploadBuffer(
+  file: { originalname: string; mimetype: string; size: number; buffer: Buffer },
+  res: Response
+) {
+  if (file.mimetype !== "application/pdf") {
+    console.warn("[upload] MIME recebido:", file.mimetype);
+  }
+
+  const parsed = await pdfParse(file.buffer);
+  console.log("[upload] pdf-parse ok. pages:", parsed?.numpages);
+
+  const extractedText: string = (parsed?.text || "").trim();
+  if (!extractedText) {
+    return res.status(422).json({
+      error: "PDF sem texto extraível (provavelmente escaneado).",
+      hint: "Peça ao laboratório um PDF exportado com texto ou habilite OCR.",
+      pages: parsed?.numpages ?? undefined,
+    });
+  }
+
+  const fileHash = bufToSha256(file.buffer);
+  const doc = await Exam.findOneAndUpdate(
+    { hash: fileHash },
+    {
+      filename: file.originalname,
+      mimetype: file.mimetype,
+      size: file.size,
+      hash: fileHash,
+      text: extractedText,
+      meta: { pages: parsed?.numpages, info: (parsed as any)?.info || null },
+    },
+    { new: true, upsert: true, setDefaultsOnInsert: true }
+  );
+
+  return res.json({
+    ok: true,
+    examId: doc._id,
+    hash: fileHash,
+    pages: parsed?.numpages,
+    filename: file.originalname,
+    textPreview: extractedText.slice(0, 4000),
+    textLength: extractedText.length,
+  });
+}
+
+/* ------------------------- Rotas de upload (com aliases) ------------------------- */
+
+// Oficial atual: /upload
 router.post("/upload", upload.single("exame"), async (req: Request, res: Response) => {
   try {
     if (!req.file) return res.status(400).json({ error: "Selecione um PDF no campo 'exame'." });
     if (!req.file.buffer || !Buffer.isBuffer(req.file.buffer)) {
       return res.status(400).json({ error: "Arquivo inválido (sem buffer)." });
     }
-
-    if (req.file.mimetype !== "application/pdf") {
-      console.warn("[upload] MIME recebido:", req.file.mimetype);
-    }
-
-    const parsed = await pdfParse(req.file.buffer);
-    console.log("[upload] pdf-parse ok. pages:", parsed?.numpages);
-
-    const extractedText: string = (parsed?.text || "").trim();
-    if (!extractedText) {
-      return res.status(422).json({
-        error: "PDF sem texto extraível (provavelmente escaneado).",
-        hint: "Peça ao laboratório um PDF exportado com texto ou habilite OCR no backend.",
-        pages: parsed?.numpages ?? undefined,
-      });
-    }
-
-    const fileHash = bufToSha256(req.file.buffer);
-    const doc = await Exam.findOneAndUpdate(
-      { hash: fileHash },
+    return await handleUploadBuffer(
       {
-        filename: req.file.originalname,
+        originalname: req.file.originalname,
         mimetype: req.file.mimetype,
         size: req.file.size,
-        hash: fileHash,
-        text: extractedText,
-        meta: { pages: parsed?.numpages, info: (parsed as any)?.info || null },
+        buffer: req.file.buffer,
       },
-      { new: true, upsert: true, setDefaultsOnInsert: true }
+      res
     );
-
-    return res.json({
-      ok: true,
-      examId: doc._id,
-      hash: fileHash,
-      pages: parsed?.numpages,
-      filename: req.file.originalname,
-      textPreview: extractedText.slice(0, 4000),
-      textLength: extractedText.length,
-    });
   } catch (err) {
     console.error("Erro /upload:", err);
     return res.status(500).json({ error: "Falha no upload/análise do PDF." });
   }
 });
 
-// -------- /exam/:id --------
+// Alias compatível: /analisar-exame
+router.post("/analisar-exame", upload.single("exame"), async (req: Request, res: Response) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "Selecione um PDF no campo 'exame'." });
+    if (!req.file.buffer || !Buffer.isBuffer(req.file.buffer)) {
+      return res.status(400).json({ error: "Arquivo inválido (sem buffer)." });
+    }
+    return await handleUploadBuffer(
+      {
+        originalname: req.file.originalname,
+        mimetype: req.file.mimetype,
+        size: req.file.size,
+        buffer: req.file.buffer,
+      },
+      res
+    );
+  } catch (err) {
+    console.error("Erro /analisar-exame:", err);
+    return res.status(500).json({ error: "Falha no upload/análise do PDF." });
+  }
+});
+
+// Alias compatível sem hífen: /analisarexame
+router.post("/analisarexame", upload.single("exame"), async (req: Request, res: Response) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "Selecione um PDF no campo 'exame'." });
+    if (!req.file.buffer || !Buffer.isBuffer(req.file.buffer)) {
+      return res.status(400).json({ error: "Arquivo inválido (sem buffer)." });
+    }
+    return await handleUploadBuffer(
+      {
+        originalname: req.file.originalname,
+        mimetype: req.file.mimetype,
+        size: req.file.size,
+        buffer: req.file.buffer,
+      },
+      res
+    );
+  } catch (err) {
+    console.error("Erro /analisarexame:", err);
+    return res.status(500).json({ error: "Falha no upload/análise do PDF." });
+  }
+});
+
+// Opcional (JSON/base64): /analisar-exame-json
+// body: { filename?: string, mimetype?: string, pdfBase64: string }
+router.post("/analisar-exame-json", async (req: Request, res: Response) => {
+  try {
+    const { pdfBase64, filename = "exame.pdf", mimetype = "application/pdf" } = req.body || {};
+    if (!pdfBase64) return res.status(400).json({ error: "Envie 'pdfBase64' no corpo." });
+
+    const buffer = Buffer.from(pdfBase64, "base64");
+    if (!buffer.length) return res.status(400).json({ error: "pdfBase64 inválido." });
+
+    return await handleUploadBuffer(
+      {
+        originalname: filename,
+        mimetype,
+        size: buffer.length,
+        buffer,
+      },
+      res
+    );
+  } catch (err) {
+    console.error("Erro /analisar-exame-json:", err);
+    return res.status(500).json({ error: "Falha ao analisar PDF (JSON)." });
+  }
+});
+
+/* ------------------------- GET exame ------------------------- */
 router.get("/exam/:id", async (req: Request, res: Response) => {
   try {
     const doc = await Exam.findById(req.params.id).lean();
@@ -232,7 +312,7 @@ router.get("/exam/:id", async (req: Request, res: Response) => {
   }
 });
 
-// -------- /suggest --------
+/* ------------------------- IA: suggest ------------------------- */
 /**
  * Body: { examId } OU { extractedText }
  * Sem regras internas. Se a IA não responder, retorna 503.
