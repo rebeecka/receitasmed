@@ -32,28 +32,33 @@ app.get("/health", (_req, res) => res.json({ ok: true, ts: new Date().toISOStrin
 // --- Health da IA ---
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 app.get("/health-ia", async (_req, res) => {
+  const hasKey = Boolean(process.env.OPENAI_API_KEY);
+  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+  if (!hasKey) {
+    return res.status(503).json({ hasKey, model, ok: false, error: "OPENAI_API_KEY ausente" });
+  }
+
   try {
-    const hasKey = !!process.env.OPENAI_API_KEY;
-    const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-    let ok = false;
-
-    if (hasKey) {
-      const r = await openai.chat.completions.create({
-        model,
-        messages: [{ role: "user", content: "ping" }],
-        max_tokens: 1,
-      });
-      ok = !!r.choices?.length;
-    }
-
-    res.json({ hasKey, model, ok });
+    const r = await openai.chat.completions.create({
+      model,
+      messages: [{ role: "user", content: "ping" }],
+      max_tokens: 1,
+    });
+    return res.json({ hasKey, model, ok: !!r.choices?.length });
   } catch (e: any) {
-    res.status(500).json({
-      hasKey: !!process.env.OPENAI_API_KEY,
+    // Não exponha a chave; retorne um diagnóstico útil
+    return res.status(502).json({
+      hasKey,
+      model,
+      ok: false,
       error: e?.message || String(e),
+      code: e?.code || null,
+      status: e?.status || null,
     });
   }
 });
+
 
 // --- ROTAS PRINCIPAIS (Monte com prefixo /api) ---
 app.use("/api", router);         // <- agora /api/analisar-exame, /api/gerar-receituario, etc.
