@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { suggestFromExamLLM } from "../lib/suggestFromExam";
+import { suggestFromExam } from "../lib/suggestFromExam";
 
 export const suggestRouter = Router();
 
@@ -13,7 +13,7 @@ suggestRouter.post("/", async (req, res) => {
     if (!rawExamText || typeof rawExamText !== "string") {
       return res.status(400).json({ error: "rawExamText vazio ou inválido" });
     }
-    const suggestions = await suggestFromExamLLM(rawExamText, patientName);
+    const suggestions = await suggestFromExam(rawExamText, patientName);
     res.json({ suggestions });
   } catch (e: any) {
     console.error("suggest error:", e);
