@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 import mongoose from "mongoose";
 import router from "./routes/uploadRoutes";
 import OpenAI from "openai";
-import suggestRouter from "./routes/suggest";
+import { suggestRouter } from "./routes/suggest";
 dotenv.config();
 
 const app = express();
