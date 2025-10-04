@@ -49,15 +49,8 @@ app.get("/health-ia", async (_req: Request, res: Response) => {
   }
 });
 
-/* ===== Import do router com fallback (ESM + extensão) ===== */
-let uploadRoutes: any;
-try {
-  // caminho correto quando o TS mantém a extensão .js
-  ({ default: uploadRoutes } = await import("./routes/uploadRoutes.js"));
-} catch {
-  // fallback caso o compilador tenha removido a extensão por alguma config
-  ({ default: uploadRoutes } = await import("./routes/uploadRoutes"));
-}
+/* ===== Import do router (ESM exige extensão .js no import relativo emitido) ===== */
+const { default: uploadRoutes } = await import("./routes/uploadRoutes.js");
 
 /* Rotas principais */
 app.use("/api", uploadRoutes);
